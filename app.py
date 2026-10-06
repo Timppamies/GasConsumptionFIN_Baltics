@@ -6,8 +6,8 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Eurostat Kaasudata", layout="wide")
-st.title("📊 Maakaasun kulutus (TWh) – Baltia & Suomi")
+st.set_page_config(page_title="Eurostat natural gas data", layout="wide")
+st.title("📊 Gas consumption (TWh) – Baltics & Finland")
 
 @st.cache_data(ttl=86400) # Välimuistitetaan haku 24 tunniksi
 def fetch_eurostat_data():
