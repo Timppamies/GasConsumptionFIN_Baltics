@@ -117,5 +117,5 @@ st.dataframe(annual_df.round(3), use_container_width=True)
 # 3. Kuukausittainen taulukko
 st.subheader("📆 Monthly table (TWh)")
 monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
-monthly_table['Koko alue'] = monthly_table.sum(axis=1)
+monthly_table['Total'] = monthly_table.sum(axis=1)
 st.dataframe(monthly_table.round(3), use_container_width=True)
