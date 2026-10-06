@@ -53,7 +53,7 @@ with st.spinner("Haetaan uusinta dataa Eurostatista..."):
 months_to_show = st.slider("Months to show:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
-# Graafi
+# 1 Graafi
 fig = go.Figure()
 for country in ['Finland', 'Estonia', 'Latvia', 'Lithuania']:
     if country in df_display.columns:
@@ -62,6 +62,40 @@ for country in ['Finland', 'Estonia', 'Latvia', 'Lithuania']:
 fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / month")
 st.plotly_chart(fig, use_container_width=True)
 
-# Taulukko
-st.subheader("Table TWh")
-st.dataframe(df_display.sort_index(ascending=False).round(3))
+# 2. Vuosittainen yhteenveto (Vuosikulutus + YTD)
+st.subheader("📅 Annual consumption (TWh)")
+
+df_melted['Year'] = df_melted['Month'].str[:4]
+annual_df = df_melted.groupby(['Year', 'Country'])['Value_TWh'].sum().unstack()
+
+# Tunnistetaan uusin vuosi ja kuinka monelta kuukaudelta dataa on
+max_year = annual_df.index.max()
+latest_month = df_melted['Month'].max()
+latest_month_num = int(latest_month.split('-')[1])
+
+# Muotoillaan riviotsikot (esim. 2026 (YTD 1-8kk))
+annual_df.index = [
+    f"{y} (YTD 1-{latest_month_num}kk)" if str(y) == str(max_year) else str(y) 
+    for y in annual_df.index
+]
+
+annual_df['Koko alue'] = annual_df.sum(axis=1)
+
+# Järjestetään vuodet uusin ylimpänä
+annual_df = annual_df.sort_index(ascending=False)
+
+# Sarakkeiden järjestys
+cols_order = [c for c in ['Finland', 'Estonia', 'Latvia', 'Lithuania'] if c in annual_df.columns] + ['Koko alue']
+annual_df = annual_df[cols_order]
+
+st.dataframe(annual_df.round(3), use_container_width=True)
+
+# 3. Kuukausittainen taulukko
+st.subheader("📆 Monthly consumption (TWh)")
+monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
+monthly_table['Koko alue'] = monthly_table.sum(axis=1)
+st.dataframe(monthly_table.round(3), use_container_width=True)
+
+# Taulukko orig 
+# st.subheader("Table TWh")
+# st.dataframe(df_display.sort_index(ascending=False).round(3))
