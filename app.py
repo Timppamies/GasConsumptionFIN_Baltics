@@ -55,23 +55,25 @@ with st.spinner("Haetaan uusinta dataa Eurostatista..."):
 # Pivot-taulukko kuukausittain
 pivot_df = df_melted.pivot(index='Month', columns='Country', values='Value_TWh')
 
-# Valikko kuukausimäärälle graafissa
-months_to_show = st.slider("Näytettävien kuukausien määrä graafissa:", 6, 36, 18)
+# Valikko kuukausimäärälle kuukausikuvaajassa
+months_to_show = st.slider("Näytettävien kuukausien määrä kuukausigraafissa:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
-# 1. Kuvaaja (Stacked Bar Chart)
-fig = go.Figure()
-for country in ['Finland', 'Estonia', 'Latvia', 'Lithuania']:
+# 1. Kuukausittainen graafi (Stacked Bar Chart)
+st.subheader("📈 Kuukausittainen kulutus (TWh)")
+fig_monthly = go.Figure()
+countries_list = ['Finland', 'Estonia', 'Latvia', 'Lithuania']
+
+for country in countries_list:
     if country in df_display.columns:
-        fig.add_trace(go.Bar(x=df_display.index, y=df_display[country], name=country))
+        fig_monthly.add_trace(go.Bar(x=df_display.index, y=df_display[country], name=country))
 
-fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / kk")
-st.plotly_chart(fig, use_container_width=True)
+fig_monthly.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / kk")
+st.plotly_chart(fig_monthly, use_container_width=True)
 
-# 2. Vuosittainen yhteenveto (Vuosikulutus + YTD)
+# 2. Vuosittainen yhteenveto (Vuosigraafi + Vuositaulukko)
 st.subheader("📅 Vuosittainen kulutus (TWh)")
 
-# Varmistetaan turvallinen vuoden poiminta
 df_melted['Year'] = df_melted['Month'].astype(str).str[:4]
 annual_df = df_melted.groupby(['Year', 'Country'])['Value_TWh'].sum().unstack()
 
@@ -80,26 +82,40 @@ max_year = annual_df.index.max()
 latest_month = df_melted['Month'].max()
 latest_month_num = int(latest_month.split('-')[1])
 
-# Muotoillaan riviotsikot (esim. 2026 (YTD 1-8kk))
+# Vuosittainen pinoava pylväskaavio (Stacked Bar Chart)
+fig_annual = go.Figure()
+for country in countries_list:
+    if country in annual_df.columns:
+        fig_annual.add_trace(go.Bar(
+            x=[f"{y} (YTD)" if str(y) == str(max_year) else str(y) for y in annual_df.index],
+            y=annual_df[country],
+            name=country
+        ))
+
+fig_annual.update_layout(
+    barmode='stack', 
+    template="plotly_white", 
+    yaxis_title="TWh / vuosi",
+    xaxis_title="Vuosi"
+)
+st.plotly_chart(fig_annual, use_container_width=True)
+
+# Muotoillaan riviotsikot taulukkoa varten
 annual_df.index = [
     f"{y} (YTD 1-{latest_month_num}kk)" if str(y) == str(max_year) else str(y) 
     for y in annual_df.index
 ]
 
 annual_df['Koko alue'] = annual_df.sum(axis=1)
-
-# Järjestetään vuodet uusin ylimpänä
 annual_df = annual_df.sort_index(ascending=False)
 
-# Sarakkeiden järjestys
-cols_order = [c for c in ['Finland', 'Estonia', 'Latvia', 'Lithuania'] if c in annual_df.columns] + ['Koko alue']
+cols_order = [c for c in countries_list if c in annual_df.columns] + ['Koko alue']
 annual_df = annual_df[cols_order]
 
 st.dataframe(annual_df.round(3), use_container_width=True)
 
 # 3. Kuukausittainen taulukko
-st.subheader("📆 Kuukausittainen kulutus (TWh)")
+st.subheader("📆 Kuukausittainen taulukko (TWh)")
 monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
 monthly_table['Koko alue'] = monthly_table.sum(axis=1)
 st.dataframe(monthly_table.round(3), use_container_width=True)
-
