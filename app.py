@@ -60,7 +60,7 @@ months_to_show = st.slider("Select how many months to show:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
 # 1. Kuukausittainen graafi (Stacked Bar Chart)
-st.subheader("📈 'Monthly consumption (TWh)")
+st.subheader("📈 Monthly consumption (TWh)")
 fig_monthly = go.Figure()
 countries_list = ['Finland', 'Estonia', 'Latvia', 'Lithuania']
 
@@ -106,16 +106,16 @@ annual_df.index = [
     for y in annual_df.index
 ]
 
-annual_df['Koko alue'] = annual_df.sum(axis=1)
+annual_df['Total'] = annual_df.sum(axis=1)
 annual_df = annual_df.sort_index(ascending=False)
 
-cols_order = [c for c in countries_list if c in annual_df.columns] + ['Koko alue']
+cols_order = [c for c in countries_list if c in annual_df.columns] + ['Total']
 annual_df = annual_df[cols_order]
 
 st.dataframe(annual_df.round(3), use_container_width=True)
 
 # 3. Kuukausittainen taulukko
-st.subheader("📆 Kuukausittainen taulukko (TWh)")
+st.subheader("📆 Monthly table (TWh)")
 monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
 monthly_table['Koko alue'] = monthly_table.sum(axis=1)
 st.dataframe(monthly_table.round(3), use_container_width=True)
