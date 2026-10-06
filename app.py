@@ -50,7 +50,7 @@ with st.spinner("Haetaan uusinta dataa Eurostatista..."):
     pivot_df = fetch_eurostat_data()
 
 # Valikko kuukausimäärälle
-months_to_show = st.slider("Näytettävien kuukausien määrä:", 6, 36, 18)
+months_to_show = st.slider("Months to show:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
 # Graafi
@@ -63,5 +63,5 @@ fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / k
 st.plotly_chart(fig, use_container_width=True)
 
 # Taulukko
-st.subheader("Taulukkomuodossa")
+st.subheader("Table TWh")
 st.dataframe(df_display.sort_index(ascending=False).round(3))
