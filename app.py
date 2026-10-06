@@ -63,8 +63,9 @@ fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / m
 st.plotly_chart(fig, use_container_width=True)
 
 # 2. Vuosittainen yhteenveto (Vuosikulutus + YTD)
-st.subheader("📅 Annual consumption (TWh)")
+st.subheader("📅 Vuosittainen kulutus (TWh)")
 
+# Varmistetaan turvallinen vuoden poiminta
 df_melted['Year'] = df_melted['Month'].astype(str).str[:4]
 annual_df = df_melted.groupby(['Year', 'Country'])['Value_TWh'].sum().unstack()
 
@@ -91,7 +92,7 @@ annual_df = annual_df[cols_order]
 st.dataframe(annual_df.round(3), use_container_width=True)
 
 # 3. Kuukausittainen taulukko
-st.subheader("📆 Monthly consumption (TWh)")
+st.subheader("📆 Kuukausittainen kulutus (TWh)")
 monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
 monthly_table['Koko alue'] = monthly_table.sum(axis=1)
 st.dataframe(monthly_table.round(3), use_container_width=True)
