@@ -56,11 +56,11 @@ with st.spinner("Haetaan uusinta dataa Eurostatista..."):
 pivot_df = df_melted.pivot(index='Month', columns='Country', values='Value_TWh')
 
 # Valikko kuukausimäärälle kuukausikuvaajassa
-months_to_show = st.slider("Näytettävien kuukausien määrä kuukausigraafissa:", 6, 36, 18)
+months_to_show = st.slider("Select how many months to show:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
 # 1. Kuukausittainen graafi (Stacked Bar Chart)
-st.subheader("📈 Kuukausittainen kulutus (TWh)")
+st.subheader("📈 'Monthly consumption (TWh)")
 fig_monthly = go.Figure()
 countries_list = ['Finland', 'Estonia', 'Latvia', 'Lithuania']
 
@@ -68,11 +68,11 @@ for country in countries_list:
     if country in df_display.columns:
         fig_monthly.add_trace(go.Bar(x=df_display.index, y=df_display[country], name=country))
 
-fig_monthly.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / kk")
+fig_monthly.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / month")
 st.plotly_chart(fig_monthly, use_container_width=True)
 
 # 2. Vuosittainen yhteenveto (Vuosigraafi + Vuositaulukko)
-st.subheader("📅 Vuosittainen kulutus (TWh)")
+st.subheader("📅 Annual consumption (TWh)")
 
 df_melted['Year'] = df_melted['Month'].astype(str).str[:4]
 annual_df = df_melted.groupby(['Year', 'Country'])['Value_TWh'].sum().unstack()
@@ -95,8 +95,8 @@ for country in countries_list:
 fig_annual.update_layout(
     barmode='stack', 
     template="plotly_white", 
-    yaxis_title="TWh / vuosi",
-    xaxis_title="Vuosi"
+    yaxis_title="TWh / year",
+    xaxis_title="Year"
 )
 st.plotly_chart(fig_annual, use_container_width=True)
 
