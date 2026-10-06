@@ -65,7 +65,7 @@ st.plotly_chart(fig, use_container_width=True)
 # 2. Vuosittainen yhteenveto (Vuosikulutus + YTD)
 st.subheader("📅 Annual consumption (TWh)")
 
-df_melted['Year'] = df_melted['Month'].str[:4]
+df_melted['Year'] = df_melted['Month'].astype(str).str[:4]
 annual_df = df_melted.groupby(['Year', 'Country'])['Value_TWh'].sum().unstack()
 
 # Tunnistetaan uusin vuosi ja kuinka monelta kuukaudelta dataa on
