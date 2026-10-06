@@ -6,8 +6,8 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Eurostat Gas Data", layout="wide")
-st.title("📊 Natural gas consumption (TWh/month) – Baltics & Finland")
+st.set_page_config(page_title="Eurostat Kaasudata", layout="wide")
+st.title("📊 Maakaasun kulutus (TWh) – Baltia & Suomi")
 
 @st.cache_data(ttl=86400) # Välimuistitetaan haku 24 tunniksi
 def fetch_eurostat_data():
@@ -32,34 +32,40 @@ def fetch_eurostat_data():
         df_filtered = df_filtered[df_filtered['unit'] == 'MIO_M3']
         
     df_filtered['Country'] = df_filtered[geo_col].map(countries)
-    date_cols = [c for c in df_filtered.columns if pd.Series(c).str.match(r'^\d{4}-\d{2}$').any()]
+    date_cols = [c for c in df_filtered.columns if pd.Series(c).astype(str).str.match(r'^\d{4}-\d{2}$').any()]
     
     df_melted = df_filtered.melt(id_vars=['Country'], value_vars=date_cols, var_name='Month', value_name='Volume_Raw')
     df_melted['Volume_Num'] = pd.to_numeric(df_melted['Volume_Raw'], errors='coerce')
     df_melted = df_melted.dropna(subset=['Volume_Num'])
+    
+    # Varmistetaan että Month-sarake on merkkijono ja suodatetaan vain muotoa YYYY-MM
+    df_melted['Month'] = df_melted['Month'].astype(str)
+    df_melted = df_melted[df_melted['Month'].str.match(r'^\d{4}-\d{2}$')]
     
     if is_tj:
         df_melted['Value_TWh'] = df_melted['Volume_Num'] * 0.000277778
     else:
         df_melted['Value_TWh'] = (df_melted['Volume_Num'] * 10.55) / 1000
         
-    pivot_df = df_melted.pivot(index='Month', columns='Country', values='Value_TWh')
-    return pivot_df
+    return df_melted
 
 with st.spinner("Haetaan uusinta dataa Eurostatista..."):
-    pivot_df = fetch_eurostat_data()
+    df_melted = fetch_eurostat_data()
 
-# Valikko kuukausimäärälle
-months_to_show = st.slider("Months to show:", 6, 36, 18)
+# Pivot-taulukko kuukausittain
+pivot_df = df_melted.pivot(index='Month', columns='Country', values='Value_TWh')
+
+# Valikko kuukausimäärälle graafissa
+months_to_show = st.slider("Näytettävien kuukausien määrä graafissa:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
-# 1 Graafi
+# 1. Kuvaaja (Stacked Bar Chart)
 fig = go.Figure()
 for country in ['Finland', 'Estonia', 'Latvia', 'Lithuania']:
     if country in df_display.columns:
         fig.add_trace(go.Bar(x=df_display.index, y=df_display[country], name=country))
 
-fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / month")
+fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / kk")
 st.plotly_chart(fig, use_container_width=True)
 
 # 2. Vuosittainen yhteenveto (Vuosikulutus + YTD)
@@ -97,6 +103,3 @@ monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
 monthly_table['Koko alue'] = monthly_table.sum(axis=1)
 st.dataframe(monthly_table.round(3), use_container_width=True)
 
-# Taulukko orig 
-# st.subheader("Table TWh")
-# st.dataframe(df_display.sort_index(ascending=False).round(3))
