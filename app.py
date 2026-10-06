@@ -59,7 +59,7 @@ for country in ['Finland', 'Estonia', 'Latvia', 'Lithuania']:
     if country in df_display.columns:
         fig.add_trace(go.Bar(x=df_display.index, y=df_display[country], name=country))
 
-fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / kk")
+fig.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / month")
 st.plotly_chart(fig, use_container_width=True)
 
 # Taulukko
