@@ -2,3 +2,4 @@ pandas
 eurostat
 plotly
 streamlit
+requests
