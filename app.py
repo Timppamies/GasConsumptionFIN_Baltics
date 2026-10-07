@@ -1,8 +1,10 @@
 import streamlit as st
 import pandas as pd
 import eurostat
+import requests
 import plotly.graph_objects as go
 import warnings
+from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
@@ -49,26 +51,99 @@ def fetch_eurostat_data():
         
     return df_melted
 
-with st.spinner("Haetaan uusinta dataa Eurostatista..."):
+@st.cache_data(ttl=86400)
+def fetch_helsinki_temperatures(start_year=2020):
+    """
+    Hakee Helsinki-Vantaan vuorokauden keskilämpötilat Open-Meteo Archive API:sta
+    ja laskee niistä kuukausittaiset keskiarvot.
+    """
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    url = f"https://archive-api.open-meteo.com/v1/archive?latitude=60.3172&longitude=24.9633&start_date={start_year}-01-01&end_date={today_str}&daily=temperature_2m_mean&timezone=Europe%2FHelsinki"
+    
+    try:
+        res = requests.get(url, timeout=15)
+        data = res.json()
+        
+        df_temp = pd.DataFrame({
+            'date': data['daily']['time'],
+            'temp': data['daily']['temperature_2m_mean']
+        })
+        
+        df_temp['date'] = pd.to_datetime(df_temp['date'])
+        df_temp['Month'] = df_temp['date'].dt.strftime('%Y-%m')
+        
+        # Ryhmitellään kuukausittain ja lasketaan keskiarvo
+        monthly_temp = df_temp.groupby('Month')['temp'].mean().reset_index()
+        monthly_temp.rename(columns={'temp': 'Temp_Helsinki'}, inplace=True)
+        return monthly_temp.set_index('Month')
+    except Exception as e:
+        st.warning(f"Could not fetch temperature data: {e}")
+        return pd.DataFrame(columns=['Temp_Helsinki'])
+
+with st.spinner("Haetaan uusinta dataa Eurostatista ja Open-Meteosta..."):
     df_melted = fetch_eurostat_data()
+    df_temp = fetch_helsinki_temperatures()
 
 # Pivot-taulukko kuukausittain
 pivot_df = df_melted.pivot(index='Month', columns='Country', values='Value_TWh')
+
+# Yhdistetään lämpötiladata pivot-taulukkoon
+pivot_df = pivot_df.join(df_temp, how='left')
 
 # Valikko kuukausimäärälle kuukausikuvaajassa
 months_to_show = st.slider("Select how many months to show:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
-# 1. Kuukausittainen graafi (Stacked Bar Chart)
-st.subheader("📈 Monthly consumption (TWh)")
+# 1. Kuukausittainen graafi (Stacked Bar + Temperature Line)
+st.subheader("📈 Monthly consumption (TWh) & Helsinki Temperature (°C)")
 fig_monthly = go.Figure()
 countries_list = ['Finland', 'Estonia', 'Latvia', 'Lithuania']
 
+# 1a. Kulutuspylväät (Ensimmäinen Y-akseli)
 for country in countries_list:
     if country in df_display.columns:
-        fig_monthly.add_trace(go.Bar(x=df_display.index, y=df_display[country], name=country))
+        fig_monthly.add_trace(go.Bar(
+            x=df_display.index, 
+            y=df_display[country], 
+            name=country,
+            yaxis='y'
+        ))
 
-fig_monthly.update_layout(barmode='stack', template="plotly_white", yaxis_title="TWh / month")
+# 1b. Lämpötilaviiva (Toinen Y-akseli)
+if 'Temp_Helsinki' in df_display.columns:
+    fig_monthly.add_trace(go.Scatter(
+        x=df_display.index,
+        y=df_display['Temp_Helsinki'],
+        name='Temp Helsinki (°C)',
+        mode='lines+markers',
+        line=dict(color='#d62728', width=3), # Punainen viiva
+        marker=dict(size=6),
+        yaxis='y2' # Ohjataan toiselle Y-akselille
+    ))
+
+# Kaksois-Y-akselin asetukset
+fig_monthly.update_layout(
+    barmode='stack', 
+    template="plotly_white", 
+    yaxis=dict(
+        title="TWh / month"
+    ),
+    yaxis2=dict(
+        title="Temperature Helsinki",
+        overlaying='y',
+        side='right',
+        showgrid=False # Ei sotketa ruudukkoa
+    ),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="right",
+        x=1
+    ),
+    hovermode="x unified"
+)
+
 st.plotly_chart(fig_monthly, use_container_width=True)
 
 # 2. Vuosittainen yhteenveto (Vuosigraafi + Vuositaulukko)
@@ -117,5 +192,13 @@ st.dataframe(annual_df.round(3), use_container_width=True)
 # 3. Kuukausittainen taulukko
 st.subheader("📆 Monthly table (TWh)")
 monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
-monthly_table['Total'] = monthly_table.sum(axis=1)
-st.dataframe(monthly_table.round(3), use_container_width=True)
+
+# Järjestetään sarakkeet taulukossa siististi (pidetään Temp_Helsinki mukana jos halutaan)
+table_cols = [c for c in countries_list if c in monthly_table.columns]
+monthly_table['Total'] = monthly_table[table_cols].sum(axis=1)
+
+show_cols = table_cols + ['Total']
+if 'Temp_Helsinki' in monthly_table.columns:
+    show_cols.append('Temp_Helsinki')
+
+st.dataframe(monthly_table[show_cols].round(3), use_container_width=True)
