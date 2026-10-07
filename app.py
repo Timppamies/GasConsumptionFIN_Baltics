@@ -132,7 +132,10 @@ fig_monthly.update_layout(
         title="Temperature Helsinki",
         overlaying='y',
         side='right',
-        showgrid=False # Ei sotketa ruudukkoa
+        showgrid=False, # Ei sotketa ruudukkoa
+        tickmode='linear',
+        tick0=0,
+        dtick=5 # Asteikon luvut 5 asteen välein (-15, -10, -5, 0, 5, 10...)
     ),
     legend=dict(
         orientation="h",
