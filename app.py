@@ -54,8 +54,8 @@ def fetch_eurostat_data():
 @st.cache_data(ttl=86400)
 def fetch_helsinki_temperatures(start_year=2020):
     """
-    Hakee Helsinki-Vantaan vuorokauden keskilämpötilat Open-Meteo Archive API:sta
-    ja laskee niistä kuukausittaiset keskiarvot.
+    Hakee Helsinki-Vantaan vuorokauden keskilämpötilat Open-Meteo Archive API:sta,
+    laskee kuukausittaiset keskiarvot ja pyöristää ne 1 desimaaliin.
     """
     today_str = datetime.today().strftime('%Y-%m-%d')
     url = f"https://archive-api.open-meteo.com/v1/archive?latitude=60.3172&longitude=24.9633&start_date={start_year}-01-01&end_date={today_str}&daily=temperature_2m_mean&timezone=Europe%2FHelsinki"
@@ -72,8 +72,8 @@ def fetch_helsinki_temperatures(start_year=2020):
         df_temp['date'] = pd.to_datetime(df_temp['date'])
         df_temp['Month'] = df_temp['date'].dt.strftime('%Y-%m')
         
-        # Ryhmitellään kuukausittain ja lasketaan keskiarvo
-        monthly_temp = df_temp.groupby('Month')['temp'].mean().reset_index()
+        # Ryhmitellään kuukausittain, lasketaan keskiarvo ja pyöristetään 1 desimaaliin
+        monthly_temp = df_temp.groupby('Month')['temp'].mean().round(1).reset_index()
         monthly_temp.rename(columns={'temp': 'Temp_Helsinki'}, inplace=True)
         return monthly_temp.set_index('Month')
     except Exception as e:
@@ -95,7 +95,7 @@ months_to_show = st.slider("Select how many months to show:", 6, 36, 18)
 df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
 
 # 1. Kuukausittainen graafi (Stacked Bar + Temperature Line)
-st.subheader("📈 Monthly consumption (TWh) & Helsinki Temperature (°C)")
+st.subheader("📈 Monthly consumption (TWh)")
 fig_monthly = go.Figure()
 countries_list = ['Finland', 'Estonia', 'Latvia', 'Lithuania']
 
@@ -193,12 +193,12 @@ st.dataframe(annual_df.round(3), use_container_width=True)
 st.subheader("📆 Monthly table (TWh)")
 monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
 
-# Järjestetään sarakkeet taulukossa siististi (pidetään Temp_Helsinki mukana jos halutaan)
 table_cols = [c for c in countries_list if c in monthly_table.columns]
 monthly_table['Total'] = monthly_table[table_cols].sum(axis=1)
 
-show_cols = table_cols + ['Total']
+# Pyöristetään kaasudata 3 desimaaliin ja lämpötila 1 desimaaliin taulukkoa varten
+formatted_table = monthly_table[table_cols + ['Total']].round(3)
 if 'Temp_Helsinki' in monthly_table.columns:
-    show_cols.append('Temp_Helsinki')
+    formatted_table['Temp_Helsinki'] = monthly_table['Temp_Helsinki'].round(1)
 
-st.dataframe(monthly_table[show_cols].round(3), use_container_width=True)
+st.dataframe(formatted_table, use_container_width=True)
