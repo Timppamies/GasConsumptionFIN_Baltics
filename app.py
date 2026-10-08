@@ -1,207 +1,430 @@
-import streamlit as st
+"""FinBalt Regional Gas Consumption: monthly and yearly consumption per country.
+
+Data: ENTSOG Transparency Platform (gas), FMI open data (temperature).
+Run with:  streamlit run finbalt_gas_consumption.py
+"""
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
+
 import pandas as pd
-import eurostat
-import requests
 import plotly.graph_objects as go
-import warnings
-from datetime import datetime
+import requests
+import streamlit as st
+from plotly.subplots import make_subplots
 
-warnings.filterwarnings("ignore")
+st.set_page_config(page_title="FinBalt Gas Consumption", page_icon="📈", layout="wide")
 
-st.set_page_config(page_title="Eurostat natural gas data", layout="wide")
-st.title("📊 Gas consumption (TWh) – Baltics & Finland")
+URL = "https://transparency.entsog.eu/api/v1/operationalData.json"
+FMI_URL = "https://opendata.fmi.fi/wfs"
+FMI_FMISID = "100968"  # Helsinki-Vantaa airport weather station
+HISTORY_START = date(2024, 1, 1)  # first full year shown in the yearly chart
+CHUNK_DAYS = 180  # one ENTSOG request covers at most this many days
 
-@st.cache_data(ttl=86400) # Välimuistitetaan haku 24 tunniksi
-def fetch_eurostat_data():
-    df_raw = eurostat.get_data_df("nrg_cb_gasm")
-    df_raw = df_raw.reset_index()
-    df_raw.columns = [str(c).split('\\')[-1].split(',')[-1].strip().lower() for c in df_raw.columns]
-    
-    geo_col = 'time_period' if 'time_period' in df_raw.columns else 'geo'
-    countries = {'FI': 'Finland', 'EE': 'Estonia', 'LV': 'Latvia', 'LT': 'Lithuania'}
-    
-    mask = (
-        df_raw[geo_col].isin(countries.keys()) & 
-        (df_raw['siec'] == 'G3000') & 
-        (df_raw['nrg_bal'] == 'IC_OBS')
-    )
-    df_filtered = df_raw[mask].copy()
-    
-    is_tj = 'unit' in df_filtered.columns and 'TJ_GCV' in df_filtered['unit'].values
-    if is_tj:
-        df_filtered = df_filtered[df_filtered['unit'] == 'TJ_GCV']
-    else:
-        df_filtered = df_filtered[df_filtered['unit'] == 'MIO_M3']
-        
-    df_filtered['Country'] = df_filtered[geo_col].map(countries)
-    date_cols = [c for c in df_filtered.columns if pd.Series(c).astype(str).str.match(r'^\d{4}-\d{2}$').any()]
-    
-    df_melted = df_filtered.melt(id_vars=['Country'], value_vars=date_cols, var_name='Month', value_name='Volume_Raw')
-    df_melted['Volume_Num'] = pd.to_numeric(df_melted['Volume_Raw'], errors='coerce')
-    df_melted = df_melted.dropna(subset=['Volume_Num'])
-    
-    # Varmistetaan että Month-sarake on merkkijono ja suodatetaan vain muotoa YYYY-MM
-    df_melted['Month'] = df_melted['Month'].astype(str)
-    df_melted = df_melted[df_melted['Month'].str.match(r'^\d{4}-\d{2}$')]
-    
-    if is_tj:
-        df_melted['Value_TWh'] = df_melted['Volume_Num'] * 0.000277778
-    else:
-        df_melted['Value_TWh'] = (df_melted['Volume_Num'] * 10.55) / 1000
-        
-    return df_melted
-
-@st.cache_data(ttl=86400)
-def fetch_helsinki_temperatures(start_year=2020):
-    """
-    Hakee Helsinki-Vantaan vuorokauden keskilämpötilat Open-Meteo Archive API:sta,
-    laskee kuukausittaiset keskiarvot ja pyöristää ne 1 desimaaliin.
-    """
-    today_str = datetime.today().strftime('%Y-%m-%d')
-    url = f"https://archive-api.open-meteo.com/v1/archive?latitude=60.3172&longitude=24.9633&start_date={start_year}-01-01&end_date={today_str}&daily=temperature_2m_mean&timezone=Europe%2FHelsinki"
-    
-    try:
-        res = requests.get(url, timeout=15)
-        data = res.json()
-        
-        df_temp = pd.DataFrame({
-            'date': data['daily']['time'],
-            'temp': data['daily']['temperature_2m_mean']
-        })
-        
-        df_temp['date'] = pd.to_datetime(df_temp['date'])
-        df_temp['Month'] = df_temp['date'].dt.strftime('%Y-%m')
-        
-        # Ryhmitellään kuukausittain, lasketaan keskiarvo ja pyöristetään 1 desimaaliin
-        monthly_temp = df_temp.groupby('Month')['temp'].mean().round(1).reset_index()
-        monthly_temp.rename(columns={'temp': 'Temp_Helsinki'}, inplace=True)
-        return monthly_temp.set_index('Month')
-    except Exception as e:
-        st.warning(f"Could not fetch temperature data: {e}")
-        return pd.DataFrame(columns=['Temp_Helsinki'])
-
-with st.spinner("Haetaan uusinta dataa Eurostatista ja Open-Meteosta..."):
-    df_melted = fetch_eurostat_data()
-    df_temp = fetch_helsinki_temperatures()
-
-# Pivot-taulukko kuukausittain
-pivot_df = df_melted.pivot(index='Month', columns='Country', values='Value_TWh')
-
-# Yhdistetään lämpötiladata pivot-taulukkoon
-pivot_df = pivot_df.join(df_temp, how='left')
-
-# Valikko kuukausimäärälle kuukausikuvaajassa
-months_to_show = st.slider("Select how many months to show:", 6, 36, 18)
-df_display = pivot_df.sort_index(ascending=True).tail(months_to_show)
-
-# 1. Kuukausittainen graafi (Stacked Bar + Temperature Line)
-st.subheader("📈 Monthly consumption (TWh)")
-fig_monthly = go.Figure()
-countries_list = ['Finland', 'Estonia', 'Latvia', 'Lithuania']
-
-# 1a. Kulutuspylväät (Ensimmäinen Y-akseli)
-for country in countries_list:
-    if country in df_display.columns:
-        fig_monthly.add_trace(go.Bar(
-            x=df_display.index, 
-            y=df_display[country], 
-            name=country,
-            yaxis='y'
-        ))
-
-# 1b. Lämpötilaviiva (Toinen Y-akseli)
-if 'Temp_Helsinki' in df_display.columns:
-    fig_monthly.add_trace(go.Scatter(
-        x=df_display.index,
-        y=df_display['Temp_Helsinki'],
-        name='Temp Helsinki (°C)',
-        mode='lines+markers',
-        line=dict(color='#d62728', width=3), # Punainen viiva
-        marker=dict(size=6),
-        yaxis='y2' # Ohjataan toiselle Y-akselille
-    ))
-
-# Kaksois-Y-akselin asetukset
-fig_monthly.update_layout(
-    barmode='stack', 
-    template="plotly_white", 
-    yaxis=dict(
-        title="TWh / month"
-    ),
-    yaxis2=dict(
-        title="Temperature Helsinki",
-        overlaying='y',
-        side='right',
-        showgrid=False, # Ei sotketa ruudukkoa
-        tickmode='linear',
-        tick0=0,
-        dtick=5 # Asteikon luvut 5 asteen välein (-15, -10, -5, 0, 5, 10...)
-    ),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="right",
-        x=1
-    ),
-    hovermode="x unified"
-)
-
-st.plotly_chart(fig_monthly, use_container_width=True)
-
-# 2. Vuosittainen yhteenveto (Vuosigraafi + Vuositaulukko)
-st.subheader("📅 Annual consumption (TWh)")
-
-df_melted['Year'] = df_melted['Month'].astype(str).str[:4]
-annual_df = df_melted.groupby(['Year', 'Country'])['Value_TWh'].sum().unstack()
-
-# Tunnistetaan uusin vuosi ja kuinka monelta kuukaudelta dataa on
-max_year = annual_df.index.max()
-latest_month = df_melted['Month'].max()
-latest_month_num = int(latest_month.split('-')[1])
-
-# Vuosittainen pinoava pylväskaavio (Stacked Bar Chart)
-fig_annual = go.Figure()
-for country in countries_list:
-    if country in annual_df.columns:
-        fig_annual.add_trace(go.Bar(
-            x=[f"{y} (YTD)" if str(y) == str(max_year) else str(y) for y in annual_df.index],
-            y=annual_df[country],
-            name=country
-        ))
-
-fig_annual.update_layout(
-    barmode='stack', 
-    template="plotly_white", 
-    yaxis_title="TWh / year",
-    xaxis_title="Year"
-)
-st.plotly_chart(fig_annual, use_container_width=True)
-
-# Muotoillaan riviotsikot taulukkoa varten
-annual_df.index = [
-    f"{y} (YTD 1-{latest_month_num}kk)" if str(y) == str(max_year) else str(y) 
-    for y in annual_df.index
+# (group, operatorKey, pointKey, direction, label)
+SERIES = [
+    # Direct consumption points (aggregated "Final consumers")
+    ("EE_cons", "EE-TSO-0001", "FNC-00037", "exit", "Estonia final consumers"),
+    ("LV_cons", "LV-TSO-0001", "FNC-00205", "exit", "Latvia domestic consumption"),
+    # Finland: balance (no consumption point reported)
+    ("FI_in", "FI-TSO-0003", "ITP-00550", "entry", "Balticconnector (EE→FI)"),
+    ("FI_in", "FI-TSO-0003", "LNG-00011", "entry", "Hamina LNG"),
+    ("FI_in", "FI-TSO-0003", "LNG-00072", "entry", "Inkoo LNG"),
+    ("FI_out", "FI-TSO-0003", "ITP-00550", "exit", "Balticconnector (FI→EE)"),
+    # Lithuania: balance (no consumption point reported)
+    ("LT_in", "LT-TSO-0001", "LNG-00030", "entry", "Klaipėda LNG"),
+    ("LT_in", "LT-TSO-0001", "ITP-00054", "entry", "Kiemenai (LV→LT)"),
+    ("LT_in", "LT-TSO-0001", "ITP-00556", "entry", "Santaka (PL→LT)"),
+    ("LT_in", "LT-TSO-0001", "ITP-00085", "entry", "Kotlovka (BY→LT)"),
+    ("LT_out_lv", "LT-TSO-0001", "ITP-00054", "exit", "Kiemenai (LT→LV)"),
+    ("LT_gipl", "LT-TSO-0001", "ITP-00556", "exit", "Santaka (LT→PL)"),
+    ("LT_kal", "LT-TSO-0001", "ITP-00050", "exit", "Sakiai (LT→RU)"),
 ]
+GROUPS = ["EE_cons", "LV_cons", "FI_in", "FI_out",
+          "LT_in", "LT_out_lv", "LT_gipl", "LT_kal"]
 
-annual_df['Total'] = annual_df.sum(axis=1)
-annual_df = annual_df.sort_index(ascending=False)
+COUNTRY_COLS = ["Finland", "Estonia", "Latvia", "Lithuania"]
+COLORS = {
+    "Finland": "#1f77b4",
+    "Estonia": "#2ca02c",
+    "Latvia": "#ff7f0e",
+    "Lithuania": "#9467bd",
+}
+TEMP_COLOR = "#d62728"
+TEMP_COL = "Helsinki-Vantaa temp (°C)"
 
-cols_order = [c for c in countries_list if c in annual_df.columns] + ['Total']
-annual_df = annual_df[cols_order]
 
-st.dataframe(annual_df.round(3), use_container_width=True)
+# ------------------------------------------------------------ ENTSOG fetch
+def _request(params):
+    """GET with retries. Raises RuntimeError if all attempts fail."""
+    err = "unknown error"
+    for attempt in range(4):
+        try:
+            r = requests.get(URL, params=params, timeout=120)
+            if r.status_code == 200:
+                return r.json().get("operationalData", [])
+            err = f"HTTP {r.status_code}"
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                break  # retrying will not help
+        except (requests.RequestException, ValueError) as e:
+            err = type(e).__name__
+        time.sleep(4 * (attempt + 1))
+    raise RuntimeError(err)
 
-# 3. Kuukausittainen taulukko
-st.subheader("📆 Monthly table (TWh)")
-monthly_table = pivot_df.sort_index(ascending=False).head(months_to_show).copy()
 
-table_cols = [c for c in countries_list if c in monthly_table.columns]
-monthly_table['Total'] = monthly_table[table_cols].sum(axis=1)
+def _chunks(start, end, days):
+    cur = start
+    while cur <= end:
+        stop = min(cur + timedelta(days=days - 1), end)
+        yield cur, stop
+        cur = stop + timedelta(days=1)
 
-# Pyöristetään kaasudata 3 desimaaliin ja lämpötila 1 desimaaliin taulukkoa varten
-formatted_table = monthly_table[table_cols + ['Total']].round(3)
-if 'Temp_Helsinki' in monthly_table.columns:
-    formatted_table['Temp_Helsinki'] = monthly_table['Temp_Helsinki'].round(1)
 
-st.dataframe(formatted_table, use_container_width=True)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_series(operator, point, direction, start_str, end_str):
+    """Daily Physical Flow (kWh/d) for one operator/point/direction.
+
+    Raises if any chunk fails, so partial results are never cached.
+    """
+    start = date.fromisoformat(start_str)
+    end = date.fromisoformat(end_str)
+
+    def one(rng):
+        a, b = rng
+        return _request({
+            "indicator": "Physical Flow",
+            "periodType": "day",
+            "from": a.isoformat(),
+            "to": b.isoformat(),
+            "pointKey": point,
+            "directionKey": direction,
+            "limit": -1,
+        })
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        parts = list(ex.map(one, list(_chunks(start, end, CHUNK_DAYS))))
+
+    days, dupes = {}, 0
+    for recs in parts:
+        for x in recs:
+            if (x.get("operatorKey") != operator
+                    or x.get("pointKey") != point
+                    or x.get("directionKey") != direction):
+                continue
+            day = str(x.get("periodFrom", ""))[:10]
+            try:
+                value = float(x.get("value") or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if day in days:
+                dupes += 1
+            days[day] = value
+    return {"days": days, "dupes": dupes}
+
+
+def load_gas(start_str, end_str):
+    frames, failed, dupes = [], [], 0
+    bar = st.progress(0.0, text="Loading ENTSOG data...")
+    for i, (grp, op, pt, d, label) in enumerate(SERIES):
+        bar.progress(i / len(SERIES), text=f"Loading {label} ({i + 1}/{len(SERIES)})")
+        try:
+            res = fetch_series(op, pt, d, start_str, end_str)
+        except Exception as e:
+            failed.append(f"{label} [{op} {pt} {d}]: {e}")
+            continue
+        dupes += res["dupes"]
+        if res["days"]:
+            frames.append(pd.DataFrame({
+                "day": list(res["days"].keys()),
+                "TWh": [v / 1e9 for v in res["days"].values()],  # kWh/d -> TWh
+                "group": grp,
+                "series": f"{grp}: {label}",
+            }))
+    bar.empty()
+    if frames:
+        raw = pd.concat(frames, ignore_index=True)
+    else:
+        raw = pd.DataFrame(columns=["day", "TWh", "group", "series"])
+    return raw, failed, dupes
+
+
+def build_monthly(raw):
+    raw = raw.copy()
+    raw["Month"] = raw["day"].str[:7]
+    g = raw.pivot_table(index="Month", columns="group", values="TWh", aggfunc="sum")
+    g = g.reindex(columns=GROUPS).fillna(0.0)
+
+    out = pd.DataFrame(index=g.index)
+    out["Finland"] = g["FI_in"] - g["FI_out"]
+    out["Estonia"] = g["EE_cons"]
+    out["Latvia"] = g["LV_cons"]
+    out["Lithuania"] = (g["LT_in"] - g["LT_out_lv"] - g["LT_gipl"] - g["LT_kal"])
+    return out.sort_index()
+
+
+# ------------------------------------------------------------- FMI weather
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_temperature(start_str, end_str):
+    """Daily mean temperature (tday, deg C) at Helsinki-Vantaa from FMI open data."""
+    start = date.fromisoformat(start_str)
+    end = date.fromisoformat(end_str)
+
+    def one(rng):
+        a, b = rng
+        params = {
+            "service": "WFS",
+            "version": "2.0.0",
+            "request": "getFeature",
+            "storedquery_id": "fmi::observations::weather::daily::simple",
+            "fmisid": FMI_FMISID,
+            "parameters": "tday",
+            "starttime": f"{a.isoformat()}T00:00:00Z",
+            "endtime": f"{b.isoformat()}T00:00:00Z",
+        }
+        err = "unknown error"
+        for attempt in range(3):
+            try:
+                r = requests.get(FMI_URL, params=params, timeout=60)
+                if r.status_code == 200:
+                    return r.content
+                err = f"HTTP {r.status_code}"
+            except requests.RequestException as e:
+                err = type(e).__name__
+            time.sleep(3 * (attempt + 1))
+        raise RuntimeError(err)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        parts = list(ex.map(one, list(_chunks(start, end, 31))))
+
+    temps = {}
+    for content in parts:
+        root = ET.fromstring(content)
+        for el in root.iter():
+            if not el.tag.endswith("BsWfsElement"):
+                continue
+            t = v = None
+            for c in el:
+                name = c.tag.rsplit("}", 1)[-1]
+                if name == "Time":
+                    t = c.text
+                elif name == "ParameterValue":
+                    v = c.text
+            if t and v and v.strip().lower() != "nan":
+                try:
+                    temps[t[:10]] = float(v)
+                except ValueError:
+                    pass
+    return temps
+
+
+def monthly_temperature(temps):
+    if not temps:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame({"day": list(temps.keys()), "t": list(temps.values())})
+    df["Month"] = df["day"].str[:7]
+    return df.groupby("Month")["t"].mean()
+
+
+# ---------------------------------------------------------------------- UI
+st.title("📈 FinBalt Regional Gas Consumption")
+st.markdown(
+    "Gas consumption per country in **Finland, Estonia, Latvia and Lithuania** "
+    "(ENTSOG, daily Physical Flow), monthly with Helsinki-Vantaa temperature, "
+    "and yearly totals."
+)
+
+if st.sidebar.button("Clear cache & refresh 🔄"):
+    st.cache_data.clear()
+    st.rerun()
+st.sidebar.caption(
+    "Data is cached for 6 hours. Series that fail to load are retried on the "
+    "next refresh; successful ones stay cached."
+)
+
+today = date.today()
+raw, failed, dupes = load_gas(HISTORY_START.isoformat(), today.isoformat())
+
+if failed:
+    st.warning(
+        "Some ENTSOG series could not be loaded, so the figures below may be "
+        "incomplete. Press the refresh button to retry (the rest is cached)."
+    )
+    with st.expander("Failed series"):
+        for f in failed:
+            st.write(f)
+
+if raw.empty:
+    st.error("No flow data retrieved from ENTSOG.")
+    st.stop()
+
+monthly = build_monthly(raw)
+
+# Temperature (optional: the app still works without it)
+try:
+    temps = fetch_temperature(HISTORY_START.isoformat(), today.isoformat())
+    temp_m = monthly_temperature(temps)
+except Exception as e:
+    temps, temp_m = {}, pd.Series(dtype=float)
+    st.warning(f"Temperature data could not be loaded from FMI ({e}). "
+               "The chart is shown without the temperature line.")
+
+n_months = len(monthly)
+max_m = max(n_months, 4)
+months_to_show = st.sidebar.slider("Months in monthly chart:", 3, max_m,
+                                   min(12, max_m), 1)
+bar_mode = st.sidebar.radio("Monthly chart style:", ["Stacked", "Grouped"])
+
+last_day = date.fromisoformat(raw["day"].max())
+latest = monthly.index[-1]
+month_end = pd.Period(latest, freq="M").end_time.date()
+partial = last_day < month_end
+
+df_m = monthly.tail(months_to_show).copy()
+df_m[TEMP_COL] = temp_m.reindex(df_m.index)
+
+# --- KPI cards
+label = f"{latest} (partial, data through {last_day})" if partial else latest
+st.subheader(f"Latest month: {label}")
+row = monthly.loc[latest]
+k = st.columns(6)
+k[0].metric("Total", f"{row[COUNTRY_COLS].sum():.1f} TWh")
+for i, c in enumerate(COUNTRY_COLS, start=1):
+    k[i].metric(c, f"{row[c]:.1f} TWh")
+t_latest = temp_m.get(latest)
+k[5].metric("Mean temp (Helsinki-Vantaa)",
+            f"{t_latest:.1f} °C" if pd.notna(t_latest) else "n/a")
+
+st.markdown("---")
+
+# --- Monthly chart with temperature on the secondary axis
+st.subheader("Monthly consumption per country (TWh) and temperature (°C)")
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+for c in COUNTRY_COLS:
+    fig.add_trace(
+        go.Bar(x=df_m.index, y=df_m[c], name=c, marker_color=COLORS[c],
+               hovertemplate="%{y:.1f} TWh"),
+        secondary_y=False,
+    )
+if df_m[TEMP_COL].notna().any():
+    fig.add_trace(
+        go.Scatter(x=df_m.index, y=df_m[TEMP_COL], name="Helsinki-Vantaa mean temp",
+                   mode="lines+markers", line=dict(color=TEMP_COLOR, width=2),
+                   marker=dict(size=6), hovertemplate="%{y:.1f} °C"),
+        secondary_y=True,
+    )
+fig.update_layout(
+    barmode="stack" if bar_mode == "Stacked" else "group",
+    template="plotly_white", height=540, hovermode="x unified",
+    xaxis_tickangle=-45, legend_title_text="",
+    legend=dict(orientation="h", y=1.08, x=0),
+)
+fig.update_yaxes(title_text="Consumption (TWh / month)", tickformat=".1f",
+                 secondary_y=False)
+fig.update_yaxes(title_text="Mean temperature (°C)", tickformat=".1f",
+                 showgrid=False, zeroline=False, secondary_y=True)
+st.plotly_chart(fig, use_container_width=True)
+
+if (df_m["Lithuania"] < 0).any() or (df_m["Finland"] < 0).any():
+    st.caption(
+        "Note: Finland and Lithuania are calculated as balances, so a single "
+        "month can come out low or even negative because of linepack changes."
+    )
+
+st.subheader("Monthly table (TWh)")
+table_m = df_m.copy()
+table_m.insert(len(COUNTRY_COLS), "Total", table_m[COUNTRY_COLS].sum(axis=1))
+st.dataframe(table_m.style.format("{:.1f}", na_rep="n/a"), use_container_width=True)
+st.download_button(
+    "Download monthly CSV 📥",
+    table_m.round(1).to_csv().encode("utf-8"),
+    file_name=f"finbalt_gas_consumption_monthly_{latest}.csv",
+    mime="text/csv",
+)
+
+st.markdown("---")
+
+# --- Yearly chart
+st.subheader("Yearly consumption per country (TWh)")
+yearly = monthly.copy()
+yearly["Year"] = yearly.index.str[:4]
+y = yearly.groupby("Year")[COUNTRY_COLS].sum()
+
+
+def year_label(yr):
+    ytd = int(yr) == last_day.year and last_day < date(last_day.year, 12, 31)
+    return f"{yr} YTD" if ytd else yr
+
+
+y.index = [year_label(i) for i in y.index]
+y_total = y.sum(axis=1)
+
+fig_y = go.Figure()
+for c in COUNTRY_COLS:
+    fig_y.add_trace(go.Bar(x=y.index, y=y[c], name=c, marker_color=COLORS[c],
+                           texttemplate="%{y:.1f}", textposition="inside",
+                           hovertemplate="%{y:.1f} TWh"))
+fig_y.add_trace(go.Scatter(x=y.index, y=y_total, mode="text",
+                           text=[f"{v:.1f}" for v in y_total],
+                           textposition="top center", showlegend=False,
+                           hoverinfo="skip"))
+fig_y.update_layout(barmode="stack", template="plotly_white", height=460,
+                    legend_title_text="", hovermode="x unified",
+                    legend=dict(orientation="h", y=1.08, x=0))
+fig_y.update_yaxes(title_text="Consumption (TWh / year)", tickformat=".1f")
+fig_y.update_xaxes(type="category")
+st.plotly_chart(fig_y, use_container_width=True)
+
+if any("YTD" in str(i) for i in y.index):
+    st.caption(f"YTD = from 1 January to {last_day} (latest ENTSOG data).")
+
+table_y = y.copy()
+table_y.insert(len(COUNTRY_COLS), "Total", y_total)
+st.dataframe(table_y.style.format("{:.1f}"), use_container_width=True)
+st.download_button(
+    "Download yearly CSV 📥",
+    table_y.round(1).to_csv().encode("utf-8"),
+    file_name=f"finbalt_gas_consumption_yearly_{latest}.csv",
+    mime="text/csv",
+)
+
+# --- Method and data quality
+with st.expander("Method and caveats"):
+    st.markdown(
+        """
+**Gas:** ENTSOG Transparency Platform, indicator *Physical Flow*, daily values
+(kWh/d), summed per month and converted to TWh.
+
+- **Estonia, Latvia:** ENTSOG aggregated *Final consumers* exit points
+  (`FNC-00037`, `FNC-00205`). Read directly, no calculation.
+- **Finland:** no consumption point is reported, so it is a balance:
+  Balticconnector (EE→FI) + Hamina LNG + Inkoo LNG − Balticconnector (FI→EE).
+  Imatra (Russia) is excluded because the border is closed.
+- **Lithuania:** no consumption point is reported, so it is a balance:
+  Klaipėda LNG + Kiemenai (LV→LT) + Santaka (PL→LT) + Kotlovka − Kiemenai (LT→LV)
+  − Santaka (LT→PL) − Sakiai (LT→RU). Sakiai is Kaliningrad transit and is
+  subtracted, not counted as Lithuanian consumption.
+- Balances ignore linepack changes, losses and domestic biogas, so individual months
+  are approximate.
+- The latest month and the current year are incomplete.
+
+**Temperature:** Finnish Meteorological Institute open data, Helsinki-Vantaa airport
+station (fmisid 100968), daily mean temperature (`tday`), averaged per month.
+The temperature is for Helsinki only and is shown as an indicator of the weather,
+not as the temperature of the whole region.
+        """
+    )
+
+with st.expander("Data quality"):
+    st.write(f"Duplicate daily records dropped: {dupes}")
+    st.write(f"Temperature days loaded: {len(temps)}")
+    sub = raw.copy()
+    sub["Month"] = sub["day"].str[:7]
+    sub = sub[sub["Month"].isin(monthly.tail(months_to_show).index)]
+    st.markdown("**Days of data per month and series**")
+    st.dataframe(sub.groupby(["Month", "series"]).size().unstack("series").fillna(0).astype(int),
+                 use_container_width=True)
+    st.markdown("**Monthly TWh per series**")
+    st.dataframe(sub.pivot_table(index="Month", columns="series", values="TWh",
+                                 aggfunc="sum").fillna(0).style.format("{:.3f}"),
+                 use_container_width=True)
