@@ -3,6 +3,7 @@
 Data: ENTSOG Transparency Platform (gas), FMI open data (temperature).
 Run with:  streamlit run finbalt_gas_consumption.py
 """
+import math
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -321,8 +322,14 @@ fig.update_layout(
 )
 fig.update_yaxes(title_text="Consumption (TWh / month)", tickformat=".1f",
                  secondary_y=False)
-fig.update_yaxes(title_text="Mean temperature (°C)", tickformat=".1f",
-                 showgrid=False, zeroline=False, secondary_y=True)
+# Temperature axis: ticks every 5 °C, range always includes 0 °C
+temp_axis = dict(tick0=0, dtick=5)
+if df_m[TEMP_COL].notna().any():
+    t_lo = min(0, math.floor(df_m[TEMP_COL].min() / 5) * 5)
+    t_hi = max(0, math.ceil(df_m[TEMP_COL].max() / 5) * 5)
+    temp_axis["range"] = [t_lo, t_hi]
+fig.update_yaxes(title_text="Mean temperature (°C)", tickformat=".0f",
+                 showgrid=False, zeroline=False, secondary_y=True, **temp_axis)
 st.plotly_chart(fig, use_container_width=True)
 
 if (df_m["Lithuania"] < 0).any() or (df_m["Finland"] < 0).any():
