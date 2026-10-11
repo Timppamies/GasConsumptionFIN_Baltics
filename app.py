@@ -23,6 +23,13 @@ FMI_FMISID = "100968"  # Helsinki-Vantaa airport weather station
 HISTORY_START = date(2024, 1, 1)  # first full year shown in the yearly chart
 CHUNK_DAYS = 180  # one ENTSOG request covers at most this many days
 
+# Cache: closed history years are kept for a month, the current year for 6 hours.
+HISTORY_TTL = 30 * 24 * 3600
+CURRENT_TTL = 6 * 3600
+# A year counts as "history" only this many days after it has ended, so that
+# late-published or revised December data is not locked in for a month.
+YEAR_GRACE_DAYS = 60
+
 # (group, operatorKey, pointKey, direction, label)
 SERIES = [
     # Direct consumption points (aggregated "Final consumers")
@@ -82,8 +89,7 @@ def _chunks(start, end, days):
         cur = stop + timedelta(days=1)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_series(operator, point, direction, start_str, end_str):
+def _fetch_series(operator, point, direction, start_str, end_str):
     """Daily Physical Flow (kWh/d) for one operator/point/direction.
 
     Raises if any chunk fails, so partial results are never cached.
@@ -124,21 +130,48 @@ def fetch_series(operator, point, direction, start_str, end_str):
     return {"days": days, "dupes": dupes}
 
 
-def load_gas(start_str, end_str):
+@st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
+def fetch_series_history(operator, point, direction, start_str, end_str):
+    """Closed history years: cached for a month."""
+    return _fetch_series(operator, point, direction, start_str, end_str)
+
+
+@st.cache_data(ttl=CURRENT_TTL, show_spinner=False)
+def fetch_series_current(operator, point, direction, start_str, end_str):
+    """Current year: cached for 6 hours."""
+    return _fetch_series(operator, point, direction, start_str, end_str)
+
+
+def history_split(today):
+    """First day of the 'current' period; everything before it is history."""
+    return max(HISTORY_START,
+               date((today - timedelta(days=YEAR_GRACE_DAYS)).year, 1, 1))
+
+
+def load_gas(start, split, end):
     frames, failed, dupes = [], [], 0
+    hist_end = split - timedelta(days=1)
     bar = st.progress(0.0, text="Loading ENTSOG data...")
     for i, (grp, op, pt, d, label) in enumerate(SERIES):
         bar.progress(i / len(SERIES), text=f"Loading {label} ({i + 1}/{len(SERIES)})")
         try:
-            res = fetch_series(op, pt, d, start_str, end_str)
+            days, n = {}, 0
+            if split > start:
+                h = fetch_series_history(op, pt, d, start.isoformat(),
+                                         hist_end.isoformat())
+                days.update(h["days"])
+                n += h["dupes"]
+            c = fetch_series_current(op, pt, d, split.isoformat(), end.isoformat())
+            days.update(c["days"])
+            n += c["dupes"]
         except Exception as e:
             failed.append(f"{label} [{op} {pt} {d}]: {e}")
             continue
-        dupes += res["dupes"]
-        if res["days"]:
+        dupes += n
+        if days:
             frames.append(pd.DataFrame({
-                "day": list(res["days"].keys()),
-                "TWh": [v / 1e9 for v in res["days"].values()],  # kWh/d -> TWh
+                "day": list(days.keys()),
+                "TWh": [v / 1e9 for v in days.values()],  # kWh/d -> TWh
                 "group": grp,
                 "series": f"{grp}: {label}",
             }))
@@ -165,8 +198,7 @@ def build_monthly(raw):
 
 
 # ------------------------------------------------------------- FMI weather
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_temperature(start_str, end_str):
+def _fetch_temperature(start_str, end_str):
     """Daily mean temperature (tday, deg C) at Helsinki-Vantaa from FMI open data."""
     start = date.fromisoformat(start_str)
     end = date.fromisoformat(end_str)
@@ -219,6 +251,25 @@ def fetch_temperature(start_str, end_str):
     return temps
 
 
+@st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
+def fetch_temperature_history(start_str, end_str):
+    return _fetch_temperature(start_str, end_str)
+
+
+@st.cache_data(ttl=CURRENT_TTL, show_spinner=False)
+def fetch_temperature_current(start_str, end_str):
+    return _fetch_temperature(start_str, end_str)
+
+
+def load_temperature(start, split, end):
+    temps = {}
+    if split > start:
+        temps.update(fetch_temperature_history(
+            start.isoformat(), (split - timedelta(days=1)).isoformat()))
+    temps.update(fetch_temperature_current(split.isoformat(), end.isoformat()))
+    return temps
+
+
 def monthly_temperature(temps):
     if not temps:
         return pd.Series(dtype=float)
@@ -235,16 +286,22 @@ st.markdown(
     "and yearly totals."
 )
 
-if st.sidebar.button("Clear cache & refresh 🔄"):
+if st.sidebar.button("Refresh current year 🔄"):
+    fetch_series_current.clear()
+    fetch_temperature_current.clear()
+    st.rerun()
+if st.sidebar.button("Clear all cache (incl. history)"):
     st.cache_data.clear()
     st.rerun()
 st.sidebar.caption(
-    "Data is cached for 6 hours. Series that fail to load are retried on the "
-    "next refresh; successful ones stay cached."
+    "History years are cached for 30 days, the current year for 6 hours. "
+    "Series that fail to load are retried on the next refresh; successful "
+    "ones stay cached."
 )
 
 today = date.today()
-raw, failed, dupes = load_gas(HISTORY_START.isoformat(), today.isoformat())
+split = history_split(today)
+raw, failed, dupes = load_gas(HISTORY_START, split, today)
 
 if failed:
     st.warning(
@@ -263,7 +320,7 @@ monthly = build_monthly(raw)
 
 # Temperature (optional: the app still works without it)
 try:
-    temps = fetch_temperature(HISTORY_START.isoformat(), today.isoformat())
+    temps = load_temperature(HISTORY_START, split, today)
     temp_m = monthly_temperature(temps)
 except Exception as e:
     temps, temp_m = {}, pd.Series(dtype=float)
@@ -414,6 +471,8 @@ with st.expander("Method and caveats"):
 - Balances ignore linepack changes, losses and domestic biogas, so individual months
   are approximate.
 - The latest month and the current year are incomplete.
+- History years are cached for 30 days, so a revision ENTSOG makes to old data
+  shows up only after that (or after "Clear all cache").
 
 **Temperature:** Finnish Meteorological Institute open data, Helsinki-Vantaa airport
 station (fmisid 100968), daily mean temperature (`tday`), averaged per month.
@@ -425,6 +484,8 @@ not as the temperature of the whole region.
 with st.expander("Data quality"):
     st.write(f"Duplicate daily records dropped: {dupes}")
     st.write(f"Temperature days loaded: {len(temps)}")
+    st.write(f"Cached as history (30 days): before {split}. "
+             f"Current (6 hours): {split} onwards.")
     sub = raw.copy()
     sub["Month"] = sub["day"].str[:7]
     sub = sub[sub["Month"].isin(monthly.tail(months_to_show).index)]
