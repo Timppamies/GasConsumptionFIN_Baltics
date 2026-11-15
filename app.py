@@ -1,54 +1,28 @@
 """FinBalt Regional Gas Consumption: monthly and yearly consumption per country.
 
 Data: ENTSOG Transparency Platform (gas), FMI open data (temperature).
-Run with:  streamlit run finbalt_gas_consumption.py
+Both are fetched every evening by GitHub Actions into data/ (fetch_data.py), so
+the app normally reads them from the repository and calls the APIs only if the
+files are missing or out of date.
+Run with:  streamlit run app.py
 """
 import math
-import time
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from entsog import HISTORY_START, SERIES
+from fmi import fetch_temperature
+from store import STALE_DAYS, TOPUP_OVERLAP_DAYS, fetch_live, load_flows, source_text
+
 st.set_page_config(page_title="FinBalt Gas Consumption", page_icon="📈", layout="wide")
 
-URL = "https://transparency.entsog.eu/api/v1/operationalData.json"
-FMI_URL = "https://opendata.fmi.fi/wfs"
-FMI_FMISID = "100968"  # Helsinki-Vantaa airport weather station
-HISTORY_START = date(2024, 1, 1)  # first full year shown in the yearly chart
-CHUNK_DAYS = 180  # one ENTSOG request covers at most this many days
+TEMP_FILE = Path(__file__).parent / "data" / "fmi_temperature.csv"
 
-# Cache: closed history years are kept for a month, the current year for 6 hours.
-HISTORY_TTL = 30 * 24 * 3600
-CURRENT_TTL = 6 * 3600
-# A year counts as "history" only this many days after it has ended, so that
-# late-published or revised December data is not locked in for a month.
-YEAR_GRACE_DAYS = 60
-
-# (group, operatorKey, pointKey, direction, label)
-SERIES = [
-    # Direct consumption points (aggregated "Final consumers")
-    ("EE_cons", "EE-TSO-0001", "FNC-00037", "exit", "Estonia final consumers"),
-    ("LV_cons", "LV-TSO-0001", "FNC-00205", "exit", "Latvia domestic consumption"),
-    # Finland: balance (no consumption point reported)
-    ("FI_in", "FI-TSO-0003", "ITP-00550", "entry", "Balticconnector (EE→FI)"),
-    ("FI_in", "FI-TSO-0003", "LNG-00011", "entry", "Hamina LNG"),
-    ("FI_in", "FI-TSO-0003", "LNG-00072", "entry", "Inkoo LNG"),
-    ("FI_out", "FI-TSO-0003", "ITP-00550", "exit", "Balticconnector (FI→EE)"),
-    # Lithuania: balance (no consumption point reported)
-    ("LT_in", "LT-TSO-0001", "LNG-00030", "entry", "Klaipėda LNG"),
-    ("LT_in", "LT-TSO-0001", "ITP-00054", "entry", "Kiemenai (LV→LT)"),
-    ("LT_in", "LT-TSO-0001", "ITP-00556", "entry", "Santaka (PL→LT)"),
-    ("LT_in", "LT-TSO-0001", "ITP-00085", "entry", "Kotlovka (BY→LT)"),
-    ("LT_out_lv", "LT-TSO-0001", "ITP-00054", "exit", "Kiemenai (LT→LV)"),
-    ("LT_gipl", "LT-TSO-0001", "ITP-00556", "exit", "Santaka (LT→PL)"),
-    ("LT_kal", "LT-TSO-0001", "ITP-00050", "exit", "Sakiai (LT→RU)"),
-]
 GROUPS = ["EE_cons", "LV_cons", "FI_in", "FI_out",
           "LT_in", "LT_out_lv", "LT_gipl", "LT_kal"]
 
@@ -63,111 +37,16 @@ TEMP_COLOR = "#d62728"
 TEMP_COL = "Helsinki-Vantaa temp (°C)"
 
 
-# ------------------------------------------------------------ ENTSOG fetch
-def _request(params):
-    """GET with retries. Raises RuntimeError if all attempts fail."""
-    err = "unknown error"
-    for attempt in range(4):
-        try:
-            r = requests.get(URL, params=params, timeout=120)
-            if r.status_code == 200:
-                return r.json().get("operationalData", [])
-            err = f"HTTP {r.status_code}"
-            if 400 <= r.status_code < 500 and r.status_code != 429:
-                break  # retrying will not help
-        except (requests.RequestException, ValueError) as e:
-            err = type(e).__name__
-        time.sleep(4 * (attempt + 1))
-    raise RuntimeError(err)
-
-
-def _chunks(start, end, days):
-    cur = start
-    while cur <= end:
-        stop = min(cur + timedelta(days=days - 1), end)
-        yield cur, stop
-        cur = stop + timedelta(days=1)
-
-
-def _fetch_series(operator, point, direction, start_str, end_str):
-    """Daily Physical Flow (kWh/d) for one operator/point/direction.
-
-    Raises if any chunk fails, so partial results are never cached.
-    """
-    start = date.fromisoformat(start_str)
-    end = date.fromisoformat(end_str)
-
-    def one(rng):
-        a, b = rng
-        return _request({
-            "indicator": "Physical Flow",
-            "periodType": "day",
-            "from": a.isoformat(),
-            "to": b.isoformat(),
-            "pointKey": point,
-            "directionKey": direction,
-            "limit": -1,
-        })
-
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        parts = list(ex.map(one, list(_chunks(start, end, CHUNK_DAYS))))
-
-    days, dupes = {}, 0
-    for recs in parts:
-        for x in recs:
-            if (x.get("operatorKey") != operator
-                    or x.get("pointKey") != point
-                    or x.get("directionKey") != direction):
-                continue
-            day = str(x.get("periodFrom", ""))[:10]
-            try:
-                value = float(x.get("value") or 0)
-            except (TypeError, ValueError):
-                value = 0.0
-            if day in days:
-                dupes += 1
-            days[day] = value
-    return {"days": days, "dupes": dupes}
-
-
-@st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
-def fetch_series_history(operator, point, direction, start_str, end_str):
-    """Closed history years: cached for a month."""
-    return _fetch_series(operator, point, direction, start_str, end_str)
-
-
-@st.cache_data(ttl=CURRENT_TTL, show_spinner=False)
-def fetch_series_current(operator, point, direction, start_str, end_str):
-    """Current year: cached for 6 hours."""
-    return _fetch_series(operator, point, direction, start_str, end_str)
-
-
-def history_split(today):
-    """First day of the 'current' period; everything before it is history."""
-    return max(HISTORY_START,
-               date((today - timedelta(days=YEAR_GRACE_DAYS)).year, 1, 1))
-
-
-def load_gas(start, split, end):
-    frames, failed, dupes = [], [], 0
-    hist_end = split - timedelta(days=1)
-    bar = st.progress(0.0, text="Loading ENTSOG data...")
-    for i, (grp, op, pt, d, label) in enumerate(SERIES):
-        bar.progress(i / len(SERIES), text=f"Loading {label} ({i + 1}/{len(SERIES)})")
-        try:
-            days, n = {}, 0
-            if split > start:
-                h = fetch_series_history(op, pt, d, start.isoformat(),
-                                         hist_end.isoformat())
-                days.update(h["days"])
-                n += h["dupes"]
-            c = fetch_series_current(op, pt, d, split.isoformat(), end.isoformat())
-            days.update(c["days"])
-            n += c["dupes"]
-        except Exception as e:
-            failed.append(f"{label} [{op} {pt} {d}]: {e}")
-            continue
-        dupes += n
+# ---------------------------------------------------------------- data load
+def load_gas(start, end, force_live=False):
+    """Stored data (updated every evening), topped up live from ENTSOG if needed."""
+    flows, failed_keys, dupes, info = load_flows(start, end, force_live)
+    failed = [f"Stored file: {failed_keys[None]}"] if None in failed_keys else []
+    frames = []
+    for grp, op, pt, d, label in SERIES:
+        if (op, pt, d) in failed_keys:
+            failed.append(f"{label} [{op} {pt} {d}]: {failed_keys[(op, pt, d)]}")
+        days = flows.get((op, pt, d), {})
         if days:
             frames.append(pd.DataFrame({
                 "day": list(days.keys()),
@@ -175,12 +54,11 @@ def load_gas(start, split, end):
                 "group": grp,
                 "series": f"{grp}: {label}",
             }))
-    bar.empty()
     if frames:
         raw = pd.concat(frames, ignore_index=True)
     else:
         raw = pd.DataFrame(columns=["day", "TWh", "group", "series"])
-    return raw, failed, dupes
+    return raw, failed, dupes, info
 
 
 def build_monthly(raw):
@@ -198,75 +76,28 @@ def build_monthly(raw):
 
 
 # ------------------------------------------------------------- FMI weather
-def _fetch_temperature(start_str, end_str):
-    """Daily mean temperature (tday, deg C) at Helsinki-Vantaa from FMI open data."""
-    start = date.fromisoformat(start_str)
-    end = date.fromisoformat(end_str)
+@st.cache_data(show_spinner=False)
+def read_stored_temperature(_path, mtime):
+    """{day: deg C} from the stored file (mtime is the cache key)."""
+    t = pd.read_csv(_path, dtype={"day": str})
+    return dict(zip(t["day"], t["tday"]))
 
-    def one(rng):
-        a, b = rng
-        params = {
-            "service": "WFS",
-            "version": "2.0.0",
-            "request": "getFeature",
-            "storedquery_id": "fmi::observations::weather::daily::simple",
-            "fmisid": FMI_FMISID,
-            "parameters": "tday",
-            "starttime": f"{a.isoformat()}T00:00:00Z",
-            "endtime": f"{b.isoformat()}T00:00:00Z",
-        }
-        err = "unknown error"
-        for attempt in range(3):
-            try:
-                r = requests.get(FMI_URL, params=params, timeout=60)
-                if r.status_code == 200:
-                    return r.content
-                err = f"HTTP {r.status_code}"
-            except requests.RequestException as e:
-                err = type(e).__name__
-            time.sleep(3 * (attempt + 1))
-        raise RuntimeError(err)
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        parts = list(ex.map(one, list(_chunks(start, end, 31))))
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_temperature_live(start_str, end_str):
+    return fetch_temperature(start_str, end_str)
 
+
+def load_temperature(start, end, force_live=False):
+    """Stored temperatures, topped up live from FMI if missing or out of date."""
     temps = {}
-    for content in parts:
-        root = ET.fromstring(content)
-        for el in root.iter():
-            if not el.tag.endswith("BsWfsElement"):
-                continue
-            t = v = None
-            for c in el:
-                name = c.tag.rsplit("}", 1)[-1]
-                if name == "Time":
-                    t = c.text
-                elif name == "ParameterValue":
-                    v = c.text
-            if t and v and v.strip().lower() != "nan":
-                try:
-                    temps[t[:10]] = float(v)
-                except ValueError:
-                    pass
-    return temps
-
-
-@st.cache_data(ttl=HISTORY_TTL, show_spinner=False)
-def fetch_temperature_history(start_str, end_str):
-    return _fetch_temperature(start_str, end_str)
-
-
-@st.cache_data(ttl=CURRENT_TTL, show_spinner=False)
-def fetch_temperature_current(start_str, end_str):
-    return _fetch_temperature(start_str, end_str)
-
-
-def load_temperature(start, split, end):
-    temps = {}
-    if split > start:
-        temps.update(fetch_temperature_history(
-            start.isoformat(), (split - timedelta(days=1)).isoformat()))
-    temps.update(fetch_temperature_current(split.isoformat(), end.isoformat()))
+    if TEMP_FILE.exists():
+        temps = read_stored_temperature(TEMP_FILE, TEMP_FILE.stat().st_mtime)
+    last = date.fromisoformat(max(temps)) if temps else None
+    if last is None or force_live or (end - last).days > STALE_DAYS:
+        live_from = start if last is None else max(
+            start, last - timedelta(days=TOPUP_OVERLAP_DAYS))
+        temps = {**temps, **fetch_temperature_live(live_from.isoformat(), end.isoformat())}
     return temps
 
 
@@ -286,27 +117,28 @@ st.markdown(
     "and yearly totals."
 )
 
-if st.sidebar.button("Refresh current year 🔄"):
-    fetch_series_current.clear()
-    fetch_temperature_current.clear()
-    st.rerun()
-if st.sidebar.button("Clear all cache (incl. history)"):
+if st.sidebar.button("Fetch latest from ENTSOG 🔄"):
+    fetch_live.clear()
+    fetch_temperature_live.clear()
+    # Kept for the session, so the live data stays when other settings change.
+    st.session_state["force_live"] = True
+if st.sidebar.button("Clear cache"):
     st.cache_data.clear()
     st.rerun()
 st.sidebar.caption(
-    "History years are cached for 30 days, the current year for 6 hours. "
-    "Series that fail to load are retried on the next refresh; successful "
-    "ones stay cached."
+    "Data is fetched from ENTSOG into the repository every evening, so the app "
+    "opens without waiting for the API. ENTSOG publishes each gas day on the "
+    "following day."
 )
+force_live = st.session_state.get("force_live", False)
 
 today = date.today()
-split = history_split(today)
-raw, failed, dupes = load_gas(HISTORY_START, split, today)
+raw, failed, dupes, info = load_gas(HISTORY_START, today, force_live)
 
 if failed:
     st.warning(
         "Some ENTSOG series could not be loaded, so the figures below may be "
-        "incomplete. Press the refresh button to retry (the rest is cached)."
+        "incomplete. Press \"Fetch latest from ENTSOG\" to retry."
     )
     with st.expander("Failed series"):
         for f in failed:
@@ -320,7 +152,7 @@ monthly = build_monthly(raw)
 
 # Temperature (optional: the app still works without it)
 try:
-    temps = load_temperature(HISTORY_START, split, today)
+    temps = load_temperature(HISTORY_START, today, force_live)
     temp_m = monthly_temperature(temps)
 except Exception as e:
     temps, temp_m = {}, pd.Series(dtype=float)
@@ -471,8 +303,8 @@ with st.expander("Method and caveats"):
 - Balances ignore linepack changes, losses and domestic biogas, so individual months
   are approximate.
 - The latest month and the current year are incomplete.
-- History years are cached for 30 days, so a revision ENTSOG makes to old data
-  shows up only after that (or after "Clear all cache").
+- The whole period is re-fetched every evening, so ENTSOG's revisions to old
+  days show up the next day.
 
 **Temperature:** Finnish Meteorological Institute open data, Helsinki-Vantaa airport
 station (fmisid 100968), daily mean temperature (`tday`), averaged per month.
@@ -484,8 +316,7 @@ not as the temperature of the whole region.
 with st.expander("Data quality"):
     st.write(f"Duplicate daily records dropped: {dupes}")
     st.write(f"Temperature days loaded: {len(temps)}")
-    st.write(f"Cached as history (30 days): before {split}. "
-             f"Current (6 hours): {split} onwards.")
+    st.write(source_text(info))
     sub = raw.copy()
     sub["Month"] = sub["day"].str[:7]
     sub = sub[sub["Month"].isin(monthly.tail(months_to_show).index)]
